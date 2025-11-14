@@ -1,0 +1,230 @@
+name: "SBOM Dependency Diff"
+description: "Generate SBOMs for base and head refs using Syft and output dependency diff (added/removed/changed) as JSON."
+author: "tomoyayamashita"
+
+branding:
+  icon: "layers"
+  color: "blue"
+
+inputs:
+  base-ref:
+    description: "Base git ref to compare (e.g. PR base branch). Defaults to GITHUB_BASE_REF or origin/main."
+    required: false
+  head-ref:
+    description: "Head git ref to compare (e.g. PR head branch). Defaults to GITHUB_HEAD_REF or HEAD."
+    required: false
+  path:
+    description: "Target path to scan for SBOM generation (e.g. '.' or 'subdir')."
+    required: false
+    default: "."
+  sbom-format:
+    description: "SBOM output format for Syft (e.g. cyclonedx-json)."
+    required: false
+    default: "cyclonedx-json"
+  syft-args:
+    description: "Additional arguments passed to Syft when generating SBOM."
+    required: false
+    default: ""
+  working-directory:
+    description: "Working directory to run git and syft commands in."
+    required: false
+    default: "."
+  fail-on-diff:
+    description: "If 'true', action exits with non-zero code when any diff is found."
+    required: false
+    default: "false"
+
+outputs:
+  has_diff:
+    description: "true if there is any dependency difference between base and head."
+    value: ${{ steps.normalize.outputs.has_diff }}
+  added:
+    description: "JSON string array of added components."
+    value: ${{ steps.normalize.outputs.added }}
+  removed:
+    description: "JSON string array of removed components."
+    value: ${{ steps.normalize.outputs.removed }}
+  changed:
+    description: "JSON string array of changed components (with old/new versions)."
+    value: ${{ steps.normalize.outputs.changed }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Prepare tools (Syft, CycloneDX CLI, jq)
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+        echo "Installing Syft..."
+        curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+          | sh -s -- -b /usr/local/bin
+
+        echo "Installing CycloneDX CLI..."
+        curl -sSfL https://github.com/CycloneDX/cyclonedx-cli/releases/latest/download/cyclonedx-linux-x64 \
+          -o /usr/local/bin/cyclonedx-cli
+        chmod +x /usr/local/bin/cyclonedx-cli
+
+        echo "Installing jq..."
+        sudo apt-get update -y
+        sudo apt-get install -y jq
+
+    - name: Generate SBOMs and raw diff
+      id: diff
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+
+        BASE_REF_INPUT="${{ inputs.base-ref }}"
+        HEAD_REF_INPUT="${{ inputs.head-ref }}"
+        TARGET_PATH="${{ inputs.path }}"
+        SBOM_FORMAT="${{ inputs.sbom-format }}"
+        SYFT_ARGS="${{ inputs.syft-args }}"
+
+        # resolve base ref
+        if [ -n "$BASE_REF_INPUT" ]; then
+          BASE_REF="$BASE_REF_INPUT"
+        elif [ -n "${GITHUB_BASE_REF:-}" ]; then
+          BASE_REF="$GITHUB_BASE_REF"
+        else
+          BASE_REF="origin/main"
+        fi
+
+        # resolve head ref
+        if [ -n "$HEAD_REF_INPUT" ]; then
+          HEAD_REF="$HEAD_REF_INPUT"
+        elif [ -n "${GITHUB_HEAD_REF:-}" ]; then
+          HEAD_REF="$GITHUB_HEAD_REF"
+        else
+          HEAD_REF="HEAD"
+        fi
+
+        echo "Base ref: $BASE_REF"
+        echo "Head ref: $HEAD_REF"
+        echo "Target path: $TARGET_PATH"
+        echo "SBOM format: $SBOM_FORMAT"
+
+        echo "::group::Generate SBOM for base ref"
+        git checkout "$BASE_REF"
+        syft "dir:${TARGET_PATH}" -o "$SBOM_FORMAT" $SYFT_ARGS > /tmp/sbom-base.json
+        echo "::endgroup::"
+
+        echo "::group::Generate SBOM for head ref"
+        git checkout "$HEAD_REF"
+        syft "dir:${TARGET_PATH}" -o "$SBOM_FORMAT" $SYFT_ARGS > /tmp/sbom-head.json
+        echo "::endgroup::"
+
+        echo "::group::Diff SBOMs"
+        # NOTE: CycloneDX CLI options/output will need to be verified during implementation
+        cyclonedx-cli diff /tmp/sbom-base.json /tmp/sbom-head.json \
+          --component-versions \
+          --output-format json > /tmp/sbom-diff-raw.json
+        echo "::endgroup::"
+
+        echo "sbom_diff_raw=/tmp/sbom-diff-raw.json" >> "$GITHUB_OUTPUT"
+
+    - name: Normalize diff JSON
+      id: normalize
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        set -euo pipefail
+
+        RAW_DIFF_PATH="${{ steps.diff.outputs.sbom_diff_raw }}"
+        if [ ! -f "$RAW_DIFF_PATH" ]; then
+          echo "Raw diff file not found: $RAW_DIFF_PATH"
+          echo "has_diff=false" >> "$GITHUB_OUTPUT"
+          echo "added=[]" >> "$GITHUB_OUTPUT"
+          echo "removed=[]" >> "$GITHUB_OUTPUT"
+          echo "changed=[]" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # CycloneDX CLI diff output structure:
+        # - .componentVersions[packageName].added[] - added versions for this package
+        # - .componentVersions[packageName].removed[] - removed versions for this package
+        #
+        # Logic:
+        # - If both added and removed exist for a package: version changed
+        # - If only added exists: newly added package
+        # - If only removed exists: removed package
+
+        ADDED_JSON=$(jq -c '
+          [
+            .componentVersions // {} |
+            to_entries[] |
+            select(
+              (.value.added // [] | length) > 0 and
+              (.value.removed // [] | length) == 0
+            ) |
+            .value.added[] |
+            {
+              name: .name,
+              version: .version,
+              purl: .purl,
+              bom_ref: (."bom-ref" // .purl),
+              type: .type
+            }
+          ]
+        ' "$RAW_DIFF_PATH")
+
+        REMOVED_JSON=$(jq -c '
+          [
+            .componentVersions // {} |
+            to_entries[] |
+            select(
+              (.value.removed // [] | length) > 0 and
+              (.value.added // [] | length) == 0
+            ) |
+            .value.removed[] |
+            {
+              name: .name,
+              version: .version,
+              purl: .purl,
+              bom_ref: (."bom-ref" // .purl),
+              type: .type
+            }
+          ]
+        ' "$RAW_DIFF_PATH")
+
+        CHANGED_JSON=$(jq -c '
+          [
+            .componentVersions // {} |
+            to_entries[] |
+            select(
+              (.value.added // [] | length) > 0 and
+              (.value.removed // [] | length) > 0
+            ) |
+            {
+              name: .key,
+              from_version: (.value.removed[0].version // ""),
+              to_version: (.value.added[0].version // ""),
+              from_purl: (.value.removed[0].purl // ""),
+              to_purl: (.value.added[0].purl // ""),
+              bom_ref: (.value.added[0]."bom-ref" // .value.added[0].purl // "")
+            }
+          ]
+        ' "$RAW_DIFF_PATH")
+
+        HAS_DIFF="false"
+        if [ "$ADDED_JSON" != "[]" ] || [ "$REMOVED_JSON" != "[]" ] || [ "$CHANGED_JSON" != "[]" ]; then
+          HAS_DIFF="true"
+        fi
+
+        echo "has_diff=$HAS_DIFF" >> "$GITHUB_OUTPUT"
+        echo "added=$ADDED_JSON" >> "$GITHUB_OUTPUT"
+        echo "removed=$REMOVED_JSON" >> "$GITHUB_OUTPUT"
+        echo "changed=$CHANGED_JSON" >> "$GITHUB_OUTPUT"
+
+        echo "has_diff: $HAS_DIFF"
+        echo "added count: $(echo "$ADDED_JSON" | jq 'length')"
+        echo "removed count: $(echo "$REMOVED_JSON" | jq 'length')"
+        echo "changed count: $(echo "$CHANGED_JSON" | jq 'length')"
+
+        # fail-on-diff processing
+        FAIL_ON_DIFF="${{ inputs.fail-on-diff }}"
+        if [ "$FAIL_ON_DIFF" = "true" ] && [ "$HAS_DIFF" = "true" ]; then
+          echo "Dependency diff detected and fail-on-diff=true. Failing job."
+          exit 1
+        fi

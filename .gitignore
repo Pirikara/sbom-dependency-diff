@@ -1,0 +1,21 @@
+# SBOM files generated during testing
+*.sbom.json
+sbom-*.json
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# Logs
+*.log
