@@ -54,7 +54,7 @@ jobs:
 
       - name: SBOM dependency diff
         id: diff
-        uses: tomoyayamashita/sbom-dependency-diff@v1
+        uses: Pirikara/sbom-dependency-diff@v1
         with:
           path: .
           sbom-format: cyclonedx-json
@@ -69,7 +69,7 @@ jobs:
 ```yaml
       - name: SBOM dependency diff
         id: diff
-        uses: tomoyayamashita/sbom-dependency-diff@v1
+        uses: Pirikara/sbom-dependency-diff@v1
         with:
           path: .
           sbom-format: cyclonedx-json
@@ -81,7 +81,7 @@ jobs:
 ```yaml
       - name: SBOM dependency diff
         id: diff
-        uses: tomoyayamashita/sbom-dependency-diff@v1
+        uses: Pirikara/sbom-dependency-diff@v1
 
       - name: Check added dependencies for vulnerabilities
         if: steps.diff.outputs.has_diff == 'true'
